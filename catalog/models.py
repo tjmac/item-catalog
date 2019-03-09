@@ -1,16 +1,13 @@
 #!/usr/bin/python2.7
 from sqlalchemy import Column, Integer, String, ForeignKey
 from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import relationship, sessionmaker
+from sqlalchemy.orm import relationship
 from sqlalchemy import create_engine
-from passlib.apps import custom_app_context as pwd_context
 import random
 import string
-from itsdangerous import (
-    TimedJSONWebSignatureSerializer as Serializer,
-    BadSignature,
-    SignatureExpired)
 
+
+db_conn_string = 'postgresql://postgres:meowmix@localhost:5432/catalog'
 
 Base = declarative_base()
 secret_key = ''.join(
@@ -75,9 +72,6 @@ class CategoryItem(Base):
         }
 
 
-engine = create_engine(
-    'sqlite:///catalog.db',
-    connect_args={
-        'check_same_thread': False})
+engine = create_engine(db_conn_string)
 
 Base.metadata.create_all(engine)

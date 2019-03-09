@@ -1,38 +1,28 @@
 #!/usr/bin/python2.7
-from models import Base, User, Category, CategoryItem
-from flask import Flask, jsonify, request, url_for, abort, \
-    g, render_template, redirect, flash
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import relationship, sessionmaker
-from sqlalchemy import create_engine
-from flask import session as login_session
+from models import User, Category, CategoryItem, engine
+from flask import Flask, jsonify, request, url_for, \
+    render_template, redirect, flash
+from sqlalchemy.orm import sessionmaker
 
-from flask_httpauth import HTTPBasicAuth
-import json
-import random
-import string
+import google_auth_oauthlib.flow
+import flask
 
-from oauth2client.client import flow_from_clientsecrets
-from oauth2client.client import FlowExchangeError
-import httplib2
-from flask import make_response
+
+import os 
+os.environ['OAUTHLIB_INSECURE_TRANSPORT'] = '1'
+
 import requests
 
 
 app = Flask(__name__)
+app.secret_key = 'super_secret_key'
 
 # for Google auth flow
-CLIENT_ID = json.loads(
-    open('client_secrets.json', 'r').read())['web']['client_id']
-APPLICATION_NAME = "Sports Category App"
+CLIENT_SECRETS_FILE = '/var/www/catalog/client_secrets_2.json'
+SCOPES = ['https://www.googleapis.com/auth/userinfo.profile',
+          'https://www.googleapis.com/auth/userinfo.email',
+          'openid' ]
 
-auth = HTTPBasicAuth()
-
-engine = create_engine(
-    'sqlite:///catalog.db',
-    connect_args={
-        'check_same_thread': False})
-Base.metadata.bind = engine
 
 # create session
 DBSession = sessionmaker(bind=engine)
@@ -42,162 +32,82 @@ session = DBSession()
 # Create anti-forgery state token
 @app.route('/login')
 def showLogin():
-    state = ''.join(random.choice(string.ascii_uppercase + string.digits)
-                    for x in xrange(32))
-    login_session['state'] = state
-    # return "The current session state is %s" % login_session['state']
-    return render_template('login.html', STATE=state)
+    flow = google_auth_oauthlib.flow.Flow.from_client_secrets_file(
+        CLIENT_SECRETS_FILE, scopes=SCOPES)
+    
+    flow.redirect_uri = url_for('oauth2callback', _external=True)
+
+    authorization_url, state = flow.authorization_url(
+        # Enable offline access so that you can refresh an access token without
+        # re-prompting the user for permission. Recommended for web server apps.
+        access_type='offline',
+        # Enable incremental authorization. Recommended as a best practice.
+        include_granted_scopes='true')
+
+    # Store the state so the callback can verify the auth server response.
+    flask.session['state'] = state
+
+    return redirect(authorization_url)
 
 
-# google connect auth flow with auth token
-@app.route('/gconnect', methods=['POST'])
-def gconnect():
-    # Validate state token
-    if request.args.get('state') != login_session['state']:
-        response = make_response(json.dumps('Invalid state parameter.'), 401)
-        response.headers['Content-Type'] = 'application/json'
-        return response
-    # Obtain authorization code
-    code = request.data
+@app.route('/oauth2callback')
+def oauth2callback():
+    # Specify the state when creating the flow in the callback so that it can
+    # verified in the authorization server response.
+    state = flask.session['state']
 
-    try:
-        # Upgrade the authorization code into a credentials object
-        oauth_flow = flow_from_clientsecrets('client_secrets.json', scope='')
-        oauth_flow.redirect_uri = 'postmessage'
-        credentials = oauth_flow.step2_exchange(code)
-    except FlowExchangeError:
-        response = make_response(
-            json.dumps('Failed to upgrade the authorization code.'), 401)
-        response.headers['Content-Type'] = 'application/json'
-        return response
+    flow = google_auth_oauthlib.flow.Flow.from_client_secrets_file(
+        CLIENT_SECRETS_FILE, scopes=SCOPES, state=state)
+    flow.redirect_uri = url_for('oauth2callback', _external=True)
 
-    # Check that the access token is valid.
-    access_token = credentials.access_token
-    url = ('https://www.googleapis.com/oauth2/v1/tokeninfo?access_token=%s'
-           % access_token)
-    h = httplib2.Http()
-    result = json.loads(h.request(url, 'GET')[1])
-    # If there was an error in the access token info, abort.
-    if result.get('error') is not None:
-        response = make_response(json.dumps(result.get('error')), 500)
-        response.headers['Content-Type'] = 'application/json'
-        return response
+    # Use the authorization server's response to fetch the OAuth 2.0 tokens.
+    authorization_response = request.url
+    flow.fetch_token(authorization_response=authorization_response)
 
-    # Verify that the access token is used for the intended user.
-    gplus_id = credentials.id_token['sub']
-    if result['user_id'] != gplus_id:
-        response = make_response(
-            json.dumps("Token's user ID doesn't match given user ID."), 401)
-        response.headers['Content-Type'] = 'application/json'
-        return response
-
-    # Verify that the access token is valid for this app.
-    if result['issued_to'] != CLIENT_ID:
-        response = make_response(
-            json.dumps("Token's client ID does not match app's."), 401)
-        print "Token's client ID does not match app's."
-        response.headers['Content-Type'] = 'application/json'
-        return response
-
-    stored_access_token = login_session.get('access_token')
-    stored_gplus_id = login_session.get('gplus_id')
-    if stored_access_token is not None and gplus_id == stored_gplus_id:
-        response = make_response(
-            json.dumps('Current user is already connected.'), 200)
-        response.headers['Content-Type'] = 'application/json'
-        return response
-
+    # Store credentials in the session.
+    # ACTION ITEM: In a production app, you likely want to save these
+    #              credentials in a persistent database instead.
+    credentials = flow.credentials
+    
     # Store the access token in the session for later use.
-    login_session['access_token'] = credentials.access_token
-    login_session['gplus_id'] = gplus_id
+    flask.session['access_token'] = credentials.token
 
     # Get user info
     userinfo_url = "https://www.googleapis.com/oauth2/v1/userinfo"
-    params = {'access_token': credentials.access_token, 'alt': 'json'}
+    params = {'access_token': credentials.token, 'alt': 'json'}
     answer = requests.get(userinfo_url, params=params)
 
     data = answer.json()
 
-    login_session['username'] = data['name']
-    login_session['picture'] = data['picture']
-    login_session['email'] = data['email']
-    # ADD PROVIDER TO LOGIN SESSION
-    login_session['provider'] = 'google'
 
     # see if user exists, if it doesn't make a new one
     user_id = getUserID(data["email"])
     if not user_id:
-        user_id = createUser(login_session)
-    login_session['user_id'] = user_id
+        user_id = createUser(data['name'], data['email'], data['picture'])
 
-    output = ''
-    output += '<h1>Welcome, '
-    output += login_session['username']
-    output += '!</h1>'
-    output += '<img src="'
-    output += login_session['picture']
-    output += '"style = "width: 300px; height: \
-        300px;border-radius: 150px;-webkit-border-radius: \
-        150px;-moz-border-radius: 150px;"> '
-    flash("You are now logged in as %s" % login_session['username'])
-    print "Logged in!"
-    return output
+    flask.session['user_id'] = user_id
+    flask.session['username'] = data['name']
+    flask.session['picture'] = data['picture']
+    flask.session['email'] = data['email']
+    flask.session['provider'] = 'google'
+
+    flask.flash("You are now logged in as %s" % flask.session['username'])
+    return flask.redirect('/')
 
 
-# DISCONNECT - Revoke a current user's token and reset their login_session
-@app.route('/gdisconnect')
-def gdisconnect():
-    # Only disconnect a connected user.
-    access_token = login_session.get('access_token')
-    if access_token is None:
-        response = make_response(
-            json.dumps('Current user not connected.'), 401)
-        response.headers['Content-Type'] = 'application/json'
-        return response
-    url = 'https://accounts.google.com/o/oauth2/revoke?token=%s' % access_token
-    h = httplib2.Http()
-    result = h.request(url, 'GET')[0]
-    if result['status'] == '200':
-        response = make_response(json.dumps('Successfully disconnected.'), 200)
-        response.headers['Content-Type'] = 'application/json'
-        return response
-    else:
-        response = make_response(
-            json.dumps(
-                'Failed to revoke token for given user.',
-                400))
-        response.headers['Content-Type'] = 'application/json'
-        return response
-
-
-# Disconnect based on provider
-@app.route('/disconnect')
-def disconnect():
-    if 'provider' in login_session:
-        if login_session['provider'] == 'google':
-            gdisconnect()
-            del login_session['gplus_id']
-            del login_session['access_token']
-        del login_session['username']
-        del login_session['email']
-        del login_session['picture']
-        del login_session['user_id']
-        del login_session['provider']
-        flash("You have successfully been logged out.")
-        return redirect(url_for('showCatalog'))
-    else:
-        flash("You were not logged in")
-        return redirect(url_for('showCatalog'))
+@app.route('/logout')
+def logout():
+    flask.session.clear()
+    return flask.redirect('/')
 
 
 # non-auth related routes
 # User Helper Functions
-def createUser(login_session):
-    newUser = User(name=login_session['username'], email=login_session[
-                   'email'], picture=login_session['picture'])
+def createUser(username, email, picture):
+    newUser = User(name=username, email=email, picture=picture)
     session.add(newUser)
     session.commit()
-    user = session.query(User).filter_by(email=login_session['email']).one()
+    user = session.query(User).filter_by(email=email).one()
     return user.id
 
 
@@ -226,7 +136,7 @@ def getCategoryId(category_name):
 def showCatalog():
     # categories = session.query(Category).order_by(asc(Category.name))
     categories = session.query(Category)
-    if 'username' not in login_session:
+    if 'username' not in flask.session:
         return render_template('publiccatalog.html', categories=categories)
     else:
         return render_template('catalog.html', categories=categories)
@@ -240,7 +150,7 @@ def showCatalog():
 def showCategoryItems(category):
     category = session.query(Category).filter_by(name=category).one()
     items = session.query(CategoryItem).filter_by(category=category).all()
-    if 'username' not in login_session:
+    if 'username' not in flask.session:
         return render_template(
             'publiccategoryitems.html',
             category=category,
@@ -258,7 +168,7 @@ def showCategoryItem(category, item_name):
     category = session.query(Category).filter_by(name=category).one()
     item_name = session.query(CategoryItem).filter_by(
         category=category, item_name=item_name).one()
-    if 'username' not in login_session:
+    if 'username' not in flask.session:
         return render_template(
             'publicitem.html',
             item_name=item_name,
@@ -281,12 +191,12 @@ def itemJSON(category, item_name):
 # Create a new category
 @app.route('/catalog/new/', methods=['GET', 'POST'])
 def newCategory():
-    if 'username' not in login_session:
+    if 'username' not in flask.session:
         return redirect('/login')
     if request.method == 'POST':
         # check for duplicates
         newCategory = Category(
-            name=request.form['name'], user_id=login_session['user_id'])
+            name=request.form['name'], user_id=flask.session['user_id'])
         session.add(newCategory)
         flash('New Category %s Successfully Created' % newCategory.name)
         session.commit()
@@ -298,14 +208,14 @@ def newCategory():
 # Create a new category item
 @app.route('/catalog/<string:category>/Items/new/', methods=['GET', 'POST'])
 def newItem(category):
-    if 'username' not in login_session:
+    if 'username' not in flask.session:
         return redirect('/login')
     category = session.query(Category).filter_by(name=category).one()
     if request.method == 'POST':
         newItem = CategoryItem(
             item_name=request.form['name'],
             item_description=request.form['description'],
-            user_id=login_session['user_id'],
+            user_id=flask.session['user_id'],
             category_id=category.id)
         session.add(newItem)
         flash('New Item %s Item Successfully Created' % (newItem.item_name))
@@ -327,9 +237,9 @@ def editItem(category, item_name):
     category_id = getCategoryId(category)
     editedItem = session.query(CategoryItem).filter_by(
         category_id=category_id, item_name=item_name).one()
-    if 'username' not in login_session:
+    if 'username' not in flask.session:
         return redirect('/login')
-    if editedItem.user_id != login_session['user_id']:
+    if editedItem.user_id != flask.session['user_id']:
         return "<script>function myFunction() {alert('You are not authorized\
             to edit this item. Please create your own item in order\
             to edit.');}</script><body onload='myFunction()'>"
@@ -360,9 +270,9 @@ def deleteItem(category, item_name):
     category_id = getCategoryId(category)
     itemToDelete = session.query(CategoryItem).filter_by(
         category_id=category_id, item_name=item_name).one()
-    if 'username' not in login_session:
+    if 'username' not in flask.session:
         return redirect('/login')
-    if itemToDelete.user_id != login_session['user_id']:
+    if itemToDelete.user_id != flask.session['user_id']:
         return "<script>function myFunction() {alert('You are not authorized \
             to delete this item. Please create your own item in order \
             to delete.');}</script><body onload='myFunction()'>"
@@ -388,6 +298,5 @@ def catalogJSON():
 
 if __name__ == '__main__':
 
-    app.secret_key = 'super_secret_key'
     app.debug = True
-    app.run(host='0.0.0.0', port=8000)
+    app.run(host='0.0.0.0', port=80)
